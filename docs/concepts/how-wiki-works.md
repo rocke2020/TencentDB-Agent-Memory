@@ -149,7 +149,7 @@ This cleanup does not ask the LLM to remove sentences that originally came from 
 
 The LLM receives the Wiki's local rules and current structure, so it can integrate knowledge rather than emit unrelated summaries. `purpose.md` and `schema.md` are inserted into the prompts as-is when they contain meaningful custom content; otherwise software-engineering defaults apply.
 
-Before processing each source, the engine also scans existing non-structural pages and gives the LLM a compact catalog containing path, title, type, and description. This catalog tells the model which subjects already have pages and should be updated.
+Before processing each source, the engine also scans existing Markdown knowledge pages under `wiki/`. It excludes the structural files `index.md`, `schema.md`, `purpose.md`, `log.md`, and `overview.md`, which organize, configure, or summarize the Wiki itself rather than represent a source, entity, concept, comparison, or synthesis. The engine gives the LLM a compact catalog of the remaining pages containing path, title, type, and description. This catalog tells the model which subjects already have pages and should be updated.
 
 For the first ingest, the catalog is empty. During later sources, it may already contain `Edge Gateway`, `Pricing Service`, and `Timeout Budget`, so the model can reuse them instead of creating near-duplicates.
 
@@ -177,13 +177,7 @@ Existing-page action: update Pricing Service if it already exists
 Cross-references: Edge Gateway -> Checkout API, Pricing Service, Timeout Budget
 ```
 
-If a source exceeds the input budget, the engine splits it at Markdown headings first, then paragraphs, with overlap between chunks. Each chunk goes through the same analysis/generation protocol, and same-path candidates from later chunks replace earlier candidates before the merge phase.
-
-### Step 7: Parse and normalize the LLM output
-
-LLM output is treated as untrusted data. The model cannot write files directly; it emits bounded blocks that the application parses and validates.
-
-One representative candidate looks like this:
+Stage B turns that plan into `FILE` blocks. One representative candidate is:
 
 ```markdown
 <<<FILE path="wiki/entities/edge-gateway.md">>>
@@ -197,10 +191,16 @@ sources:
 
 # Edge Gateway
 
-The Edge Gateway calls [[Checkout API]] and [[Pricing Service]] within the
-[[Timeout Budget]].
+The Edge Gateway calls [[Checkout API]] and [[Pricing Service]]. These calls
+must complete before the three-second [[Timeout Budget]] expires.
 <<<END>>>
 ```
+
+If a source exceeds the input budget, the engine splits it at Markdown headings first, then paragraphs, with overlap between chunks. Each chunk goes through the same analysis/generation protocol, and same-path candidates from later chunks replace earlier candidates before the merge phase.
+
+### Step 7: Parse and normalize the LLM output
+
+LLM output is treated as untrusted data. The model cannot write files directly; it emits bounded blocks like the Stage B candidate above, which the application parses and validates.
 
 The parser discards truncated blocks, empty blocks, absolute paths, traversal paths, and anything outside `wiki/`. The application then derives the final path again from frontmatter `type + title`, for example `entity + Edge Gateway` becomes `wiki/entities/edge-gateway.md`. Structural files such as `index.md`, `schema.md`, `purpose.md`, `log.md`, and `overview.md` cannot be overwritten by generated candidates.
 
@@ -216,6 +216,48 @@ The merge order is:
 2. If the new body is already contained in the old body, keep the old body and only union the `sources` lists.
 3. If the existing body is at most 4,000 characters, ask the LLM to rewrite one merged page while preserving old facts and noting conflicts.
 4. If it is larger, ask only for an incremental fragment and append it, reducing output tokens and the risk of losing old facts.
+
+The second rule is a no-LLM fast path. Suppose the existing page is:
+
+```markdown
+---
+type: entity
+title: Pricing Service
+sources:
+  - design-edge-gateway.md
+---
+
+Pricing Service provides prices to Edge Gateway.
+```
+
+A later source produces a candidate with the same body but different provenance:
+
+```markdown
+---
+type: entity
+title: Pricing Service
+sources:
+  - ops-pricing-timeout.md
+---
+
+Pricing Service provides prices to Edge Gateway.
+```
+
+The service keeps the existing body without calling the LLM and writes the union of both `sources` lists:
+
+```markdown
+---
+type: entity
+title: Pricing Service
+sources:
+  - design-edge-gateway.md
+  - ops-pricing-timeout.md
+---
+
+Pricing Service provides prices to Edge Gateway.
+```
+
+This check is textual rather than semantic: it collapses whitespace and tests whether the complete new body is a substring of the old body. Two differently worded sentences with the same meaning do not take this fast path; they continue to the size-based LLM merge rules.
 
 After all three example sources, the generated layer may look like:
 
@@ -250,6 +292,8 @@ In the example, the index exposes Sources, Entities, and Concepts, while the ove
 
 The graph is not a second LLM product. It is deterministically derived from the saved pages, in the same database transaction that rebuilds search metadata and records source ingest results. Page files are written before this SQLite transaction, so the Markdown and database are not one cross-filesystem atomic commit; a failed build remains retryable because uncommitted source status is not marked `ingested`.
 
+The Wiki has a graph data model, but it does not use a dedicated graph database such as Neo4j. Markdown files are the canonical page content: frontmatter `type` organizes pages into directories such as `wiki/entities/` and `wiki/concepts/`, while the normalized title gives each page its stable ID and filename. Each Wiki then stores its persistent search and graph indexes in its own SQLite `index.db`. On the read path, the service loads the stored nodes and edges into a temporary in-memory Graphology graph for traversal and visualization.
+
 The service scans every Markdown page and writes four logical datasets in the per-Wiki `index.db`:
 
 | Table | Derived data |
@@ -266,6 +310,8 @@ entities/edge-gateway -> entities/checkout-api
 entities/edge-gateway -> entities/pricing-service
 entities/edge-gateway -> concepts/timeout-budget
 ```
+
+These are generic, unlabelled `links-to` edges. The graph records only `source_id -> target_id`; relationship meanings such as “calls” or “must complete before the timeout expires” remain natural-language statements in the Markdown body. Therefore, the example does not create a `calls` edge, a `governed-by` edge, or a hierarchy in which the service pages are contained inside `Timeout Budget`.
 
 Unresolved links, self-links, and duplicate source-target pairs do not become graph edges. Search indexes all page types, while the public graph excludes hidden `query` pages. The graph API presents a deduplicated undirected view for visualization; search results still describe whether a related page is an inbound, outbound, or bidirectional neighbor.
 
